@@ -19,4 +19,8 @@ impl Transport {
             Transport::Direct(cfg) => direct::connect_tcp(target, cfg.interface.as_ref()).await,
         }
     }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Transport::Direct(_))
+    }
 }

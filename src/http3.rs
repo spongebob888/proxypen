@@ -23,26 +23,26 @@ pub async fn test(transport: &Transport, target: &TestTarget, timeout: Duration)
             protocol: Protocol::Http3,
             status: TestStatus::Failed(e.to_string()),
             http_status: None,
-            timing: Timing {
-                socks_handshake: Duration::ZERO,
-                tls_handshake: None,
-                first_byte: Duration::ZERO,
-                total: Duration::ZERO,
-            },
+            timing: empty_timing(),
             response_size: None,
         },
         Err(_) => TestResult {
             protocol: Protocol::Http3,
             status: TestStatus::Failed("timeout".into()),
             http_status: None,
-            timing: Timing {
-                socks_handshake: Duration::ZERO,
-                tls_handshake: None,
-                first_byte: Duration::ZERO,
-                total: Duration::ZERO,
-            },
+            timing: empty_timing(),
             response_size: None,
         },
+    }
+}
+
+fn empty_timing() -> Timing {
+    Timing {
+        socks_handshake: None,
+        tcp_connect: None,
+        tls_handshake: None,
+        first_byte: Duration::ZERO,
+        total: Duration::ZERO,
     }
 }
 
@@ -57,7 +57,13 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
         Transport::Socks5(cfg) => build_socks_endpoint(cfg, target).await?,
         Transport::Direct(cfg) => build_direct_endpoint(cfg, target).await?,
     };
-    let socks_handshake = start.elapsed();
+    // Only meaningful in SOCKS5 mode (UDP ASSOCIATE handshake).
+    // In direct mode there is no underlying connect step (UDP is connectionless).
+    let socks_handshake = if transport.is_direct() {
+        None
+    } else {
+        Some(start.elapsed())
+    };
 
     let client_config = make_quic_client_config()?;
 
@@ -144,6 +150,7 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
         http_status: Some(http_status),
         timing: Timing {
             socks_handshake,
+            tcp_connect: None,
             tls_handshake: Some(quic_handshake),
             first_byte,
             total,

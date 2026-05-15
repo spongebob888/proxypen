@@ -26,7 +26,10 @@ pub enum TestStatus {
 
 #[derive(Debug, Clone)]
 pub struct Timing {
-    pub socks_handshake: Duration,
+    /// Time to complete the SOCKS5 handshake (proxy modes only).
+    pub socks_handshake: Option<Duration>,
+    /// Time to complete the direct TCP connect (direct mode, TCP-based protocols).
+    pub tcp_connect: Option<Duration>,
     pub tls_handshake: Option<Duration>,
     pub first_byte: Duration,
     pub total: Duration,
@@ -48,10 +51,17 @@ impl fmt::Display for TestResult {
             TestStatus::Success => {
                 let status = self.http_status.unwrap_or(0);
                 let total = self.timing.total.as_millis();
-                let socks = self.timing.socks_handshake.as_millis();
                 let ttfb = self.timing.first_byte.as_millis();
 
-                write!(f, "{:<10} OK {} ({total}ms) socks:{socks}ms", proto, status)?;
+                write!(f, "{:<10} OK {} ({total}ms)", proto, status)?;
+
+                if let Some(socks) = self.timing.socks_handshake {
+                    write!(f, " socks:{}ms", socks.as_millis())?;
+                }
+
+                if let Some(tcp) = self.timing.tcp_connect {
+                    write!(f, " tcp:{}ms", tcp.as_millis())?;
+                }
 
                 if let Some(tls) = self.timing.tls_handshake {
                     write!(f, " tls:{}ms", tls.as_millis())?;

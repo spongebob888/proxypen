@@ -21,26 +21,26 @@ pub async fn test(transport: &Transport, target: &TestTarget, timeout: Duration)
             protocol: Protocol::Http2,
             status: TestStatus::Failed(e.to_string()),
             http_status: None,
-            timing: Timing {
-                socks_handshake: Duration::ZERO,
-                tls_handshake: None,
-                first_byte: Duration::ZERO,
-                total: Duration::ZERO,
-            },
+            timing: empty_timing(),
             response_size: None,
         },
         Err(_) => TestResult {
             protocol: Protocol::Http2,
             status: TestStatus::Failed("timeout".into()),
             http_status: None,
-            timing: Timing {
-                socks_handshake: Duration::ZERO,
-                tls_handshake: None,
-                first_byte: Duration::ZERO,
-                total: Duration::ZERO,
-            },
+            timing: empty_timing(),
             response_size: None,
         },
+    }
+}
+
+fn empty_timing() -> Timing {
+    Timing {
+        socks_handshake: None,
+        tcp_connect: None,
+        tls_handshake: None,
+        first_byte: Duration::ZERO,
+        total: Duration::ZERO,
     }
 }
 
@@ -55,7 +55,12 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
 
     // Establish underlying TCP transport (SOCKS5 tunnel or direct).
     let stream = transport.connect_tcp(target).await?;
-    let socks_handshake = start.elapsed();
+    let connect_time = start.elapsed();
+    let (socks_handshake, tcp_connect) = if transport.is_direct() {
+        (None, Some(connect_time))
+    } else {
+        (Some(connect_time), None)
+    };
 
     // TLS handshake with h2 ALPN
     let tls_start = Instant::now();
@@ -116,6 +121,7 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
         http_status: Some(http_status),
         timing: Timing {
             socks_handshake,
+            tcp_connect,
             tls_handshake: Some(tls_handshake),
             first_byte,
             total,

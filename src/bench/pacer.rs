@@ -49,3 +49,47 @@ impl Pacer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_bandwidth_returns_max_target() {
+        let p = Pacer::new(0, 1200);
+        assert_eq!(p.target_packets_now(), u64::MAX);
+    }
+
+    #[test]
+    fn target_packets_grows_with_time() {
+        // 80 Mbit/s with 1000-byte packets ⇒ 10000 pps ⇒ 10 packets per ms.
+        let p = Pacer::new(80_000_000, 1000);
+        let before = p.target_packets_now();
+        std::thread::sleep(Duration::from_millis(50));
+        let after = p.target_packets_now();
+        let delta = after - before;
+        // Allow generous slack for scheduler jitter, but the order of
+        // magnitude must be right (50ms × 10 pkt/ms ≈ 500).
+        assert!(
+            (300..=800).contains(&delta),
+            "expected ~500 packets in 50ms, got {delta}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_until_packet_returns_after_due_time() {
+        // 1 Mbit/s, 1000-byte packets ⇒ 125 packets/sec ⇒ 8 ms per packet.
+        let p = Pacer::new(1_000_000, 1000);
+        let t0 = Instant::now();
+        p.sleep_until_packet(5).await; // due at ~40 ms
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "sleep returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "sleep ran way too long: {elapsed:?}"
+        );
+    }
+}

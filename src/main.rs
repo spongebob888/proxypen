@@ -361,7 +361,8 @@ async fn run_benchmark(args: BenchArgs) -> anyhow::Result<()> {
         udp_size: args.udp_size,
         tcp_chunk: args.tcp_chunk,
     };
-    run_client(opts).await
+    let _outcomes = run_client(opts).await?;
+    Ok(())
 }
 
 async fn run_bench_server(args: ServerArgs) -> anyhow::Result<()> {

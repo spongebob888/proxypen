@@ -48,13 +48,30 @@ pub enum BenchDirection {
 }
 
 #[derive(Debug, Clone)]
-struct Plan {
-    kind: u8,
-    bandwidth_bps: u64,
-    label: String,
+pub struct Plan {
+    pub kind: u8,
+    pub bandwidth_bps: u64,
+    pub label: String,
 }
 
-pub async fn run(opts: BenchOptions) -> anyhow::Result<()> {
+#[derive(Debug, Clone)]
+pub struct BenchOutcome {
+    pub plan: Plan,
+    pub client: TestReport,
+    pub server: TestReport,
+}
+
+/// Run the benchmark, print results to stdout, and return the per-test outcomes.
+pub async fn run(opts: BenchOptions) -> anyhow::Result<Vec<BenchOutcome>> {
+    run_inner(opts, true).await
+}
+
+/// Run the benchmark without printing anything. For tests / programmatic use.
+pub async fn run_quiet(opts: BenchOptions) -> anyhow::Result<Vec<BenchOutcome>> {
+    run_inner(opts, false).await
+}
+
+async fn run_inner(opts: BenchOptions, print: bool) -> anyhow::Result<Vec<BenchOutcome>> {
     // Optional in-process server (--serve).
     let _serve_guard = if opts.serve {
         Some(spawn_local_server(&opts).await?)
@@ -77,14 +94,16 @@ pub async fn run(opts: BenchOptions) -> anyhow::Result<()> {
         bail!("no tests selected (check --mode/--direction/--udp-bandwidth)");
     }
 
-    println!(
-        "bench client → {target}    {}",
-        match &opts.transport {
-            Transport::Direct(_) => "direct".to_string(),
-            Transport::Socks5(c) => format!("via socks5://{}", c.addr),
-        }
-    );
-    println!();
+    if print {
+        println!(
+            "bench client → {target}    {}",
+            match &opts.transport {
+                Transport::Direct(_) => "direct".to_string(),
+                Transport::Socks5(c) => format!("via socks5://{}", c.addr),
+            }
+        );
+        println!();
+    }
 
     let mut control = opts
         .transport
@@ -94,6 +113,7 @@ pub async fn run(opts: BenchOptions) -> anyhow::Result<()> {
     read_handshake(&mut control).await?;
 
     let mut udp_used = false;
+    let mut outcomes: Vec<BenchOutcome> = Vec::new();
 
     for plan in plans {
         let req = TestRequest {
@@ -158,13 +178,20 @@ pub async fn run(opts: BenchOptions) -> anyhow::Result<()> {
             _ => unreachable!(),
         };
 
-        print_result(&plan, &client_report, &server_report);
+        if print {
+            print_result(&plan, &client_report, &server_report);
+        }
+        outcomes.push(BenchOutcome {
+            plan,
+            client: client_report,
+            server: server_report,
+        });
     }
 
     TestRequest::close().write(&mut control).await?;
     let _ = control.shutdown().await;
 
-    if udp_used {
+    if print && udp_used {
         println!();
         println!(
             "note: one-way latency is relative to the path delay of the first packet; \
@@ -173,7 +200,7 @@ pub async fn run(opts: BenchOptions) -> anyhow::Result<()> {
         );
     }
 
-    Ok(())
+    Ok(outcomes)
 }
 
 // ------------- in-process server (--serve) -------------
@@ -543,6 +570,48 @@ pub fn parse_bandwidth_list(s: &str) -> anyhow::Result<Vec<u64>> {
     s.split(',')
         .map(|p| parse_bandwidth(p.trim()))
         .collect()
+}
+
+#[cfg(test)]
+mod parse_bandwidth_tests {
+    use super::*;
+
+    #[test]
+    fn plain_integer() {
+        assert_eq!(parse_bandwidth("1000").unwrap(), 1000);
+    }
+
+    #[test]
+    fn si_suffixes() {
+        assert_eq!(parse_bandwidth("1k").unwrap(), 1_000);
+        assert_eq!(parse_bandwidth("1K").unwrap(), 1_000);
+        assert_eq!(parse_bandwidth("5M").unwrap(), 5_000_000);
+        assert_eq!(parse_bandwidth("2G").unwrap(), 2_000_000_000);
+    }
+
+    #[test]
+    fn fractional_with_suffix() {
+        assert_eq!(parse_bandwidth("1.5M").unwrap(), 1_500_000);
+        assert_eq!(parse_bandwidth("0.5G").unwrap(), 500_000_000);
+    }
+
+    #[test]
+    fn list_of_bandwidths() {
+        let v = parse_bandwidth_list("1M,5M,10M").unwrap();
+        assert_eq!(v, vec![1_000_000, 5_000_000, 10_000_000]);
+    }
+
+    #[test]
+    fn list_handles_whitespace() {
+        let v = parse_bandwidth_list("1M , 5M ,10M").unwrap();
+        assert_eq!(v, vec![1_000_000, 5_000_000, 10_000_000]);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_bandwidth("abc").is_err());
+        assert!(parse_bandwidth("").is_err());
+    }
 }
 
 pub fn parse_bandwidth(s: &str) -> anyhow::Result<u64> {

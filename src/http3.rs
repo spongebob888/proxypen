@@ -8,14 +8,16 @@ use rustls::ClientConfig;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::config::{ProxyConfig, TestTarget};
+use crate::direct::{self, DirectConfig};
 use crate::error::{ProxyPenError, Result};
 use crate::result::{Protocol, TestResult, TestStatus, Timing};
 use crate::socks::associate;
+use crate::transport::Transport;
 use crate::udp_socket::SocksUdpSocket;
 
-/// Test HTTP/3 through a SOCKS5 proxy (via UDP ASSOCIATE).
-pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) -> TestResult {
-    match tokio::time::timeout(timeout, do_test(config, target)).await {
+/// Test HTTP/3 over the supplied transport (QUIC).
+pub async fn test(transport: &Transport, target: &TestTarget, timeout: Duration) -> TestResult {
+    match tokio::time::timeout(timeout, do_test(transport, target)).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => TestResult {
             protocol: Protocol::Http3,
@@ -44,48 +46,20 @@ pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) 
     }
 }
 
-async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult> {
+async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResult> {
     let start = Instant::now();
 
-    // Establish SOCKS5 UDP association
-    let assoc = associate::associate(config).await?;
+    // Build the quinn::Endpoint and pick the SocketAddr to connect to.
+    // The two transports differ in how the UDP socket is constructed:
+    //   - SOCKS5: UDP ASSOCIATE on the proxy + a SOCKS5-wrapped socket.
+    //   - Direct: a plain bound UDP socket.
+    let (endpoint, target_socket_addr, control) = match transport {
+        Transport::Socks5(cfg) => build_socks_endpoint(cfg, target).await?,
+        Transport::Direct(cfg) => build_direct_endpoint(cfg, target).await?,
+    };
     let socks_handshake = start.elapsed();
 
-    // Create the SOCKS5 UDP socket wrapper for quinn
-    let socks_addr = target.to_socks_addr();
-
-    // Determine the target SocketAddr for QUIC connection.
-    // For domain targets, we need a resolved addr for quinn's connect().
-    // The actual routing goes through SOCKS5, so we use the relay addr as a placeholder
-    // if target is a domain.
-    let target_socket_addr = resolve_target_addr(target, assoc.relay_addr)?;
-
-    let udp_socket = SocksUdpSocket::new(assoc.socket, socks_addr.clone(), target_socket_addr);
-
-    // Configure QUIC/TLS with h3 ALPN
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
-
-    let mut tls_config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-    let quic_config: QuicClientConfig = tls_config
-        .try_into()
-        .map_err(|e| ProxyPenError::Quic(format!("QUIC config: {e}")))?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-
-    // Create quinn endpoint with our custom socket
-    let runtime = quinn::default_runtime()
-        .ok_or_else(|| ProxyPenError::Quic("no async runtime".into()))?;
-    let endpoint = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
-        None,
-        Arc::new(udp_socket),
-        runtime,
-    )
-    .map_err(|e| ProxyPenError::Quic(format!("endpoint: {e}")))?;
+    let client_config = make_quic_client_config()?;
 
     // QUIC connect
     let quic_start = Instant::now();
@@ -109,21 +83,14 @@ async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult
     };
     let req = http::Request::builder()
         .method("GET")
-        .uri(format!(
-            "https://{}{}",
-            target.authority(),
-            path
-        ))
+        .uri(format!("https://{}{}", target.authority(), path))
         .header("user-agent", "proxypen/0.1")
         .body(())
         .map_err(|e| ProxyPenError::Http(format!("request build: {e}")))?;
 
     // The h3 driver must be polled concurrently for the connection to process
     // incoming data (QPACK streams, flow control, data routing to request streams).
-    // Use tokio::select! so we return as soon as the request completes.
-    let drive_fut = async {
-        std::future::poll_fn(|cx| driver.poll_close(cx)).await
-    };
+    let drive_fut = async { std::future::poll_fn(|cx| driver.poll_close(cx)).await };
 
     let request_start = start;
     let request_fut = async move {
@@ -146,7 +113,6 @@ async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult
         let first_byte = request_start.elapsed();
         let http_status = response.status().as_u16();
 
-        // Read body
         let mut total_size = 0usize;
         while let Some(chunk) = stream
             .recv_data()
@@ -163,15 +129,14 @@ async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult
         ))
     };
 
-    // Run both concurrently — select returns when either completes
     let request_result = tokio::select! {
         result = request_fut => result,
         _ = drive_fut => Err(ProxyPenError::Http("connection closed unexpectedly".into())),
     };
     let (http_status, total_size, first_byte, total) = request_result?;
 
-    // Keep control stream alive until we're done
-    drop(assoc.control);
+    // Keep the SOCKS5 control stream alive until the request is done.
+    drop(control);
 
     Ok(TestResult {
         protocol: Protocol::Http3,
@@ -187,10 +152,71 @@ async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult
     })
 }
 
-/// Resolve target to a SocketAddr for quinn's connect().
-/// For IP targets, just use the IP:port directly.
-/// For domain targets, use the relay addr (SOCKS5 handles actual routing).
-fn resolve_target_addr(target: &TestTarget, relay_addr: SocketAddr) -> Result<SocketAddr> {
+/// SOCKS5 path: UDP ASSOCIATE → wrap UDP socket → quinn endpoint with abstract socket.
+async fn build_socks_endpoint(
+    config: &ProxyConfig,
+    target: &TestTarget,
+) -> Result<(quinn::Endpoint, SocketAddr, Option<tokio::net::TcpStream>)> {
+    let assoc = associate::associate(config).await?;
+    let socks_addr = target.to_socks_addr();
+    let target_socket_addr = resolve_target_for_socks(target, assoc.relay_addr)?;
+
+    let udp_socket = SocksUdpSocket::new(assoc.socket, socks_addr, target_socket_addr);
+
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| ProxyPenError::Quic("no async runtime".into()))?;
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        Arc::new(udp_socket),
+        runtime,
+    )
+    .map_err(|e| ProxyPenError::Quic(format!("endpoint: {e}")))?;
+
+    Ok((endpoint, target_socket_addr, Some(assoc.control)))
+}
+
+/// Direct path: bind a UDP socket (optionally on a specific interface) and
+/// hand it to quinn::Endpoint::new.
+async fn build_direct_endpoint(
+    config: &DirectConfig,
+    target: &TestTarget,
+) -> Result<(quinn::Endpoint, SocketAddr, Option<tokio::net::TcpStream>)> {
+    let target_addr = direct::resolve_target(target).await?;
+    let std_socket = direct::build_udp_socket(target_addr.is_ipv6(), config.interface.as_ref())?;
+
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| ProxyPenError::Quic("no async runtime".into()))?;
+    let endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        std_socket,
+        runtime,
+    )
+    .map_err(|e| ProxyPenError::Quic(format!("endpoint: {e}")))?;
+
+    Ok((endpoint, target_addr, None))
+}
+
+fn make_quic_client_config() -> Result<quinn::ClientConfig> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut tls_config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_config: QuicClientConfig = tls_config
+        .try_into()
+        .map_err(|e| ProxyPenError::Quic(format!("QUIC config: {e}")))?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+}
+
+/// Resolve target to a SocketAddr for quinn's connect() in SOCKS5 mode.
+/// For domain targets without a resolved IP, use the relay addr (SOCKS5
+/// handles the actual routing).
+fn resolve_target_for_socks(target: &TestTarget, relay_addr: SocketAddr) -> Result<SocketAddr> {
     if let Some(ip) = target.resolved_addr {
         Ok(SocketAddr::new(ip, target.port))
     } else if let Ok(ip) = target.host.parse::<IpAddr>() {

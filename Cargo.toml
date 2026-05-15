@@ -49,3 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # URL parsing
 url = "2"
+
+# Socket-level options (interface binding for direct mode)
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"

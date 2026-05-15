@@ -7,15 +7,15 @@ use http::Request;
 use rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
-use crate::config::{ProxyConfig, TestTarget};
+use crate::config::TestTarget;
 use crate::error::{ProxyPenError, Result};
 use crate::result::{Protocol, TestResult, TestStatus, Timing};
-use crate::socks::connector;
 use crate::tls::make_tls_config;
+use crate::transport::Transport;
 
-/// Test HTTP/2 through a SOCKS5 proxy.
-pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) -> TestResult {
-    match tokio::time::timeout(timeout, do_test(config, target)).await {
+/// Test HTTP/2 over the supplied transport (TLS with h2 ALPN).
+pub async fn test(transport: &Transport, target: &TestTarget, timeout: Duration) -> TestResult {
+    match tokio::time::timeout(timeout, do_test(transport, target)).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => TestResult {
             protocol: Protocol::Http2,
@@ -44,7 +44,7 @@ pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) 
     }
 }
 
-async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult> {
+async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResult> {
     if !target.use_tls {
         return Err(ProxyPenError::InvalidConfig(
             "HTTP/2 requires TLS (use https:// target)".into(),
@@ -53,8 +53,8 @@ async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult
 
     let start = Instant::now();
 
-    // SOCKS5 TCP CONNECT
-    let stream = connector::connect(config, target).await?;
+    // Establish underlying TCP transport (SOCKS5 tunnel or direct).
+    let stream = transport.connect_tcp(target).await?;
     let socks_handshake = start.elapsed();
 
     // TLS handshake with h2 ALPN

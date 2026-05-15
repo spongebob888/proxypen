@@ -1,19 +1,30 @@
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use proxypen::{ProxyAuth, ProxyConfig, ProxyPen, TestTarget};
+use proxypen::{
+    DirectConfig, InterfaceSpec, ProxyAuth, ProxyConfig, ProxyPen, TestTarget, Transport,
+    direct::parse_interface,
+};
 use url::Url;
 
 #[derive(Parser)]
-#[command(name = "proxypen", about = "Test SOCKS5 proxy with HTTP/1, HTTP/2, HTTP/3")]
+#[command(
+    name = "proxypen",
+    about = "Test HTTP/1, HTTP/2, HTTP/3 over a SOCKS5 proxy or directly"
+)]
 struct Cli {
-    /// SOCKS5 proxy URL: socks5://[user:pass@]host:port
+    /// SOCKS5 proxy URL: socks5://[user:pass@]host:port. Omit to test directly.
     #[arg(short = 'p', long)]
-    proxy: String,
+    proxy: Option<String>,
 
     /// Target URL: http[s]://host[:port]/path
     #[arg(short = 't', long)]
     target: String,
+
+    /// Bind direct connection to this interface (name, e.g. "en0", or local IP).
+    /// Only valid when --proxy is not set.
+    #[arg(short = 'i', long)]
+    interface: Option<String>,
 
     /// Protocol to test
     #[arg(short = 'P', long, default_value = "all")]
@@ -41,7 +52,6 @@ enum ProtocolArg {
 }
 
 fn parse_proxy_url(raw: &str) -> anyhow::Result<ProxyConfig> {
-    // Normalize: if no scheme, add socks5://
     let url_str = if raw.contains("://") {
         raw.to_string()
     } else {
@@ -88,23 +98,50 @@ fn parse_target_url(raw: &str) -> anyhow::Result<TestTarget> {
     })
 }
 
+fn build_transport(cli: &Cli) -> anyhow::Result<Transport> {
+    match (&cli.proxy, &cli.interface) {
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "--interface is only valid in direct mode (omit --proxy)"
+        )),
+        (Some(proxy), None) => Ok(Transport::Socks5(parse_proxy_url(proxy)?)),
+        (None, iface) => {
+            let interface: Option<InterfaceSpec> = iface.as_deref().map(parse_interface);
+            Ok(Transport::Direct(DirectConfig::new(interface)))
+        }
+    }
+}
+
+fn header_line(cli: &Cli, target: &TestTarget) -> String {
+    match &cli.proxy {
+        Some(proxy) => format!(
+            "Testing proxy {} -> {}:{}",
+            proxy, target.host, target.port
+        ),
+        None => {
+            let mut line = format!("Testing direct -> {}:{}", target.host, target.port);
+            if let Some(iface) = &cli.interface {
+                line.push_str(&format!(" (interface: {iface})"));
+            }
+            line
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Install ring as the default crypto provider (needed when both ring and aws-lc-rs features are enabled)
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
     let cli = Cli::parse();
 
-    // Setup logging
     let filter = if cli.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .init();
 
-    let config = parse_proxy_url(&cli.proxy)?;
+    let transport = build_transport(&cli)?;
     let mut target = parse_target_url(&cli.target)?;
     let timeout = Duration::from_secs(cli.timeout);
 
@@ -112,12 +149,9 @@ async fn main() -> anyhow::Result<()> {
         target.resolve_local().await?;
     }
 
-    let pen = ProxyPen::new(config);
+    let pen = ProxyPen::new(transport);
 
-    println!(
-        "Testing proxy {} -> {}:{}",
-        cli.proxy, target.host, target.port
-    );
+    println!("{}", header_line(&cli, &target));
     println!();
 
     let results = match cli.protocol {
@@ -131,7 +165,6 @@ async fn main() -> anyhow::Result<()> {
         println!("{result}");
     }
 
-    // Exit with error code if any test failed
     let all_success = results
         .iter()
         .all(|r| matches!(r.status, proxypen::TestStatus::Success));

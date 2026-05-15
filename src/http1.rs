@@ -5,15 +5,15 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 
-use crate::config::{ProxyConfig, TestTarget};
+use crate::config::TestTarget;
 use crate::error::{ProxyPenError, Result};
 use crate::result::{Protocol, TestResult, TestStatus, Timing};
-use crate::socks::connector;
 use crate::tls::make_tls_config;
+use crate::transport::Transport;
 
-/// Test HTTP/1.1 through a SOCKS5 proxy.
-pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) -> TestResult {
-    match tokio::time::timeout(timeout, do_test(config, target)).await {
+/// Test HTTP/1.1 over the supplied transport.
+pub async fn test(transport: &Transport, target: &TestTarget, timeout: Duration) -> TestResult {
+    match tokio::time::timeout(timeout, do_test(transport, target)).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => TestResult {
             protocol: Protocol::Http1,
@@ -42,11 +42,11 @@ pub async fn test(config: &ProxyConfig, target: &TestTarget, timeout: Duration) 
     }
 }
 
-async fn do_test(config: &ProxyConfig, target: &TestTarget) -> Result<TestResult> {
+async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResult> {
     let start = Instant::now();
 
-    // SOCKS5 TCP CONNECT
-    let stream = connector::connect(config, target).await?;
+    // Establish underlying TCP transport (SOCKS5 tunnel or direct).
+    let stream = transport.connect_tcp(target).await?;
     let socks_handshake = start.elapsed();
 
     let mut tls_handshake_duration = None;

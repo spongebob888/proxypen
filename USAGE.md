@@ -65,7 +65,8 @@ proxypen [test] [-p PROXY] [-i IFACE] -t URL [-P PROTO] [-T SECS] [-r] [-v]
 | `-t, --target URL`   | `http[s]://host[:port]/path`                                  |
 | `-P, --protocol P`   | `http1` \| `http2` \| `http3` \| `all` (default)              |
 | `-T, --timeout SECS` | Per-test timeout. Default `30`.                               |
-| `-r, --resolve`      | Resolve DNS locally (instead of letting the proxy do it).     |
+| `-r, --resolve`      | Resolve DNS locally with the system resolver (instead of letting the proxy do it). |
+| `--dns-server ADDR`  | Use this DNS server (IP or IP:PORT, default port 53). The query is sent via the configured transport — see "DNS resolution" below. |
 | `-v, --verbose`      | Debug logging.                                                |
 
 Examples:
@@ -229,6 +230,41 @@ Use them to compare runs between the same host pair (e.g. proxy vs direct, or
 two proxy implementations), not as a standalone metric.
 
 ---
+
+## DNS resolution
+
+By default, hostname resolution follows the transport:
+
+- **Direct mode:** the system resolver (`/etc/resolv.conf` on Unix) is used.
+- **SOCKS5 mode:** the hostname is sent to the proxy and the proxy resolves
+  it. Pass `--resolve` to force the system resolver to do it locally, then
+  send the IP through the proxy.
+
+Pass `--dns-server <IP[:PORT]>` to do the lookup yourself against a chosen
+server:
+
+- `--proxy + --dns-server`  → the query is sent over SOCKS5 UDP ASSOCIATE
+  (requires the proxy to support UDP relay).
+- `--interface + --dns-server` → the query is sent on a UDP socket bound to
+  that interface.
+- `--dns-server` alone → plain UDP query on the default route.
+
+Only A records are supported today; AAAA is not.
+
+```sh
+# Resolve via Cloudflare, then HTTP/1 to that IP directly
+proxypen --dns-server 1.1.1.1 -t http://example.com/ -P http1
+
+# Direct test on en0, with DNS also on en0
+proxypen -i en0 --dns-server 8.8.8.8 -t https://example.com/ -P http2
+
+# Through a SOCKS5 proxy, DNS via the proxy at a custom server
+proxypen -p socks5://127.0.0.1:1080 --dns-server 9.9.9.9 -t https://example.com/
+
+# Bench: resolve the bench server's hostname via your DNS, route via proxy
+proxypen benchmark -p socks5://127.0.0.1:1080 --dns-server 1.1.1.1 \
+                   --target bench.example.com:5555 --mode tcp
+```
 
 ## Notes
 

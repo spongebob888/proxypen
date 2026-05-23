@@ -13,7 +13,6 @@ use crate::bench::protocol::{
 };
 use crate::bench::server;
 use crate::bench::stats::UdpStats;
-use crate::bench::udp_io::BenchUdpSocket;
 use crate::config::TestTarget;
 use crate::transport::Transport;
 
@@ -330,7 +329,7 @@ async fn run_udp_up(
     datagram_size: usize,
     bandwidth_bps: u64,
 ) -> anyhow::Result<TestReport> {
-    let socket = BenchUdpSocket::open(transport, server_udp_addr).await?;
+    let socket = transport.open_udp(server_udp_addr).await?;
     let mut buf = vec![0u8; datagram_size.max(UDP_HEADER_LEN)];
 
     let session_start = Instant::now();
@@ -384,7 +383,7 @@ async fn run_udp_down(
     duration: Duration,
     datagram_size: usize,
 ) -> anyhow::Result<TestReport> {
-    let socket = BenchUdpSocket::open(transport, server_udp_addr).await?;
+    let socket = transport.open_udp(server_udp_addr).await?;
     let mut hello = vec![0u8; datagram_size.max(UDP_HEADER_LEN)];
     encode_udp_header(&mut hello[..UDP_HEADER_LEN], 0, 0);
     socket.send(&hello).await?;

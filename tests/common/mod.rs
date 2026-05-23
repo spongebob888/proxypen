@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Once;
 
 use shadowquic::Manager;
@@ -12,7 +12,7 @@ use shadowquic::config::{AuthUser, DirectOutCfg, SocksServerCfg};
 use shadowquic::direct::outbound::DirectOut;
 use shadowquic::socks::inbound::SocksServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::oneshot;
 
 /// Pick a free TCP port by binding ephemeral and immediately dropping the
@@ -113,6 +113,51 @@ impl Drop for Socks5Guard {
     fn drop(&mut self) {
         self._abort.abort();
     }
+}
+
+/// A toy DNS server that answers every query with the supplied A record.
+/// Returns the bind address and a `oneshot::Sender` whose drop stops the
+/// server.
+pub async fn start_fake_dns(answer: Ipv4Addr) -> (SocketAddr, oneshot::Sender<()>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => return,
+                r = sock.recv_from(&mut buf) => {
+                    let (n, peer) = match r { Ok(v) => v, Err(_) => continue };
+                    if let Some(resp) = build_dns_response(&buf[..n], answer) {
+                        let _ = sock.send_to(&resp, peer).await;
+                    }
+                }
+            }
+        }
+    });
+    (addr, stop_tx)
+}
+
+fn build_dns_response(req: &[u8], answer: Ipv4Addr) -> Option<Vec<u8>> {
+    if req.len() < 12 {
+        return None;
+    }
+    let mut r = req.to_vec();
+    // QR=1 (response), keep RD; RA=1, RCODE=0.
+    r[2] |= 0x80;
+    r[3] = 0x80;
+    // ANCOUNT = 1
+    r[6] = 0;
+    r[7] = 1;
+    // Append answer: NAME pointer to offset 12, TYPE=A, CLASS=IN, TTL=60, RDLEN=4, IP.
+    r.extend_from_slice(&[0xC0, 0x0C]);
+    r.extend_from_slice(&1u16.to_be_bytes());
+    r.extend_from_slice(&1u16.to_be_bytes());
+    r.extend_from_slice(&60u32.to_be_bytes());
+    r.extend_from_slice(&4u16.to_be_bytes());
+    r.extend_from_slice(&answer.octets());
+    Some(r)
 }
 
 /// Start the proxypen bench server in-process and return the bound address.

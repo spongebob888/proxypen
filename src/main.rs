@@ -8,6 +8,7 @@ use proxypen::{
         BenchDirection, BenchMode, BenchOptions, parse_bandwidth_list, run_client, run_server,
     },
     direct::parse_interface,
+    dns::{self, DnsConfig},
 };
 use url::Url;
 
@@ -47,6 +48,14 @@ struct TransportArgs {
     /// Only valid when --proxy is not set.
     #[arg(short = 'i', long, global = true)]
     interface: Option<String>,
+
+    /// DNS server (IP or IP:PORT, default port 53) used to resolve hostnames.
+    /// The query is sent via the same transport: through --proxy when set, or
+    /// bound to --interface when set; otherwise plain UDP. Omit to fall back
+    /// to the system resolver (and to let the proxy resolve hostnames itself
+    /// for `test`/`benchmark`).
+    #[arg(long, global = true)]
+    dns_server: Option<String>,
 }
 
 impl TransportArgs {
@@ -60,6 +69,13 @@ impl TransportArgs {
                 let interface: Option<InterfaceSpec> = iface.as_deref().map(parse_interface);
                 Ok(Transport::Direct(DirectConfig::new(interface)))
             }
+        }
+    }
+
+    fn build_dns(&self) -> anyhow::Result<Option<DnsConfig>> {
+        match &self.dns_server {
+            None => Ok(None),
+            Some(s) => Ok(Some(DnsConfig::new(dns::parse_server(s)?))),
         }
     }
 }
@@ -246,14 +262,33 @@ fn parse_target_url(raw: &str) -> anyhow::Result<TestTarget> {
     })
 }
 
-async fn parse_bench_target(raw: &str) -> anyhow::Result<SocketAddr> {
+async fn parse_bench_target(
+    raw: &str,
+    dns: Option<&DnsConfig>,
+    transport: &Transport,
+) -> anyhow::Result<SocketAddr> {
     if let Ok(addr) = raw.parse::<SocketAddr>() {
         return Ok(addr);
+    }
+    if let Some(dns) = dns {
+        let (host, port) = split_host_port(raw)?;
+        let ip = dns::resolve_a(transport, dns, host).await?;
+        return Ok(SocketAddr::from((ip, port)));
     }
     tokio::net::lookup_host(raw)
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("could not resolve {raw}"))
+}
+
+fn split_host_port(raw: &str) -> anyhow::Result<(&str, u16)> {
+    let (host, port) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected HOST:PORT, got '{raw}'"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid port in '{raw}'"))?;
+    Ok((host, port))
 }
 
 fn install_logging(verbose: bool) {
@@ -285,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_test(args: TestArgs) -> anyhow::Result<()> {
     install_logging(args.verbose);
     let transport = args.transport.build()?;
+    let dns_cfg = args.transport.build_dns()?;
     let target_url = args
         .target
         .as_deref()
@@ -292,7 +328,14 @@ async fn run_test(args: TestArgs) -> anyhow::Result<()> {
     let mut target = parse_target_url(target_url)?;
     let timeout = Duration::from_secs(args.timeout);
 
-    if args.resolve {
+    if let Some(dns) = &dns_cfg {
+        // --dns-server implies local resolution through the configured
+        // transport. Skip the system resolver path.
+        if target.host.parse::<IpAddr>().is_err() {
+            let ip = dns::resolve_a(&transport, dns, &target.host).await?;
+            target.resolved_addr = Some(IpAddr::V4(ip));
+        }
+    } else if args.resolve {
         target.resolve_local().await?;
     }
 
@@ -342,10 +385,11 @@ async fn run_benchmark(args: BenchArgs) -> anyhow::Result<()> {
     install_logging(args.verbose);
 
     let transport = args.transport.build()?;
+    let dns_cfg = args.transport.build_dns()?;
     let bandwidths = parse_bandwidth_list(&args.udp_bandwidth)?;
 
     let target = match &args.target {
-        Some(t) => Some(parse_bench_target(t).await?),
+        Some(t) => Some(parse_bench_target(t, dns_cfg.as_ref(), &transport).await?),
         None => None,
     };
 

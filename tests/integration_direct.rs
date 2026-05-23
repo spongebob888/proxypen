@@ -2,17 +2,19 @@
 
 mod common;
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use proxypen::bench::{
     BenchDirection, BenchMode, BenchOptions, run_client_quiet,
 };
 use proxypen::direct::parse_interface;
+use proxypen::dns::{self, DnsConfig};
 use proxypen::{
     DirectConfig, InterfaceSpec, ProxyPen, TestStatus, TestTarget, Transport,
 };
 
-use common::{install_rustls, start_http1_echo};
+use common::{install_rustls, start_fake_dns, start_http1_echo};
 
 fn direct_transport() -> Transport {
     Transport::Direct(DirectConfig::new(None))
@@ -137,6 +139,50 @@ async fn bench_udp_direct_serve_low_bandwidth() {
     // No duplicates and no out-of-order on loopback
     assert_eq!(o.server.dup, 0, "duplicates seen on loopback");
     assert_eq!(o.server.ooo, 0, "out-of-order seen on loopback");
+}
+
+#[tokio::test]
+async fn dns_resolve_direct_via_fake_server() {
+    let (dns_addr, _stop) = start_fake_dns(Ipv4Addr::new(10, 11, 12, 13)).await;
+    let dns = DnsConfig::new(dns_addr);
+    let ip = dns::resolve_a(&direct_transport(), &dns, "anywhere.test")
+        .await
+        .expect("DNS resolve failed");
+    assert_eq!(ip, Ipv4Addr::new(10, 11, 12, 13));
+}
+
+#[tokio::test]
+async fn http1_direct_uses_custom_dns_to_reach_local_server() {
+    // End-to-end: fake DNS points "made.up" at the local HTTP server, and the
+    // HTTP probe should follow that resolution and succeed.
+    install_rustls();
+    let http_server = start_http1_echo("hi via custom dns").await;
+    let answer = match http_server.ip() {
+        IpAddr::V4(v) => v,
+        IpAddr::V6(_) => panic!("expected IPv4 from start_http1_echo"),
+    };
+    let (dns_addr, _stop_dns) = start_fake_dns(answer).await;
+
+    let transport = direct_transport();
+    let dns = DnsConfig::new(dns_addr);
+    let ip = dns::resolve_a(&transport, &dns, "made.up").await.unwrap();
+
+    let target = TestTarget {
+        host: "made.up".to_string(),
+        port: http_server.port(),
+        path: "/".into(),
+        use_tls: false,
+        resolved_addr: Some(IpAddr::V4(ip)),
+    };
+    let pen = ProxyPen::new(transport);
+    let result = pen.test_http1(&target, Duration::from_secs(5)).await;
+
+    assert!(
+        matches!(result.status, TestStatus::Success),
+        "expected success, got {:?}",
+        result.status
+    );
+    assert_eq!(result.http_status, Some(200));
 }
 
 #[tokio::test]

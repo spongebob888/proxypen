@@ -2,14 +2,16 @@
 
 mod common;
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use proxypen::bench::{
     BenchDirection, BenchMode, BenchOptions, run_client_quiet,
 };
+use proxypen::dns::{self, DnsConfig};
 use proxypen::{ProxyConfig, ProxyPen, TestStatus, TestTarget, Transport};
 
-use common::{install_rustls, start_http1_echo, start_socks5_server};
+use common::{install_rustls, start_fake_dns, start_http1_echo, start_socks5_server};
 
 fn target_for(addr: std::net::SocketAddr) -> TestTarget {
     TestTarget {
@@ -74,6 +76,22 @@ async fn bench_tcp_through_socks5() {
     assert!(up.server.bytes > 0, "TCP-up over SOCKS5 received nothing");
     let down = &outcomes[1];
     assert!(down.client.bytes > 0, "TCP-down over SOCKS5 received nothing");
+}
+
+#[tokio::test]
+async fn dns_resolve_through_socks5_udp_associate() {
+    // Verifies that a DNS query traverses the SOCKS5 UDP relay end-to-end:
+    // the fake DNS server replies to the proxy's outbound UDP socket, and
+    // the proxy relays back to the client.
+    let proxy = start_socks5_server().await;
+    let (dns_addr, _stop_dns) = start_fake_dns(Ipv4Addr::new(42, 42, 42, 42)).await;
+
+    let transport = socks_transport(proxy.addr);
+    let dns = DnsConfig::new(dns_addr);
+    let ip = dns::resolve_a(&transport, &dns, "via.proxy.test")
+        .await
+        .expect("DNS over SOCKS5 failed");
+    assert_eq!(ip, Ipv4Addr::new(42, 42, 42, 42));
 }
 
 #[tokio::test]

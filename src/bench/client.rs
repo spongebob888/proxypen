@@ -429,6 +429,7 @@ fn synthetic_target(addr: SocketAddr) -> TestTarget {
         path: String::new(),
         use_tls: false,
         resolved_addr: Some(addr.ip()),
+        danger_accept_invalid_certs: false,
     }
 }
 

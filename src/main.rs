@@ -3,12 +3,15 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use proxypen::{
-    DirectConfig, InterfaceSpec, ProxyAuth, ProxyConfig, ProxyPen, TestTarget, Transport,
+    DirectConfig, HttpServerConfig, InterfaceSpec, PressOptions, PressProtocol, ProxyAuth,
+    ProxyConfig, ProxyPen, TestTarget, Transport,
     bench::{
         BenchDirection, BenchMode, BenchOptions, parse_bandwidth_list, run_client, run_server,
     },
     direct::parse_interface,
     dns::{self, DnsConfig},
+    press,
+    run_http_server,
 };
 use url::Url;
 
@@ -34,6 +37,10 @@ enum Command {
     Benchmark(BenchArgs),
     /// Run the standalone bench server (paired with `benchmark` on another host).
     Server(ServerArgs),
+    /// Press/retest: measure latency (p50, p99) at given concurrency.
+    Press(PressArgs),
+    /// Start a local HTTP/1, HTTP/2, HTTP/3 test server.
+    ServeHttp(ServeHttpArgs),
 }
 
 // ---------------- shared transport flags ----------------
@@ -213,6 +220,88 @@ struct ServerArgs {
     verbose: bool,
 }
 
+// ---------------- press / retest ----------------
+
+#[derive(Args, Clone)]
+struct PressArgs {
+    #[command(flatten)]
+    transport: TransportArgs,
+
+    /// Target URL: http[s]://host[:port]/path
+    #[arg(short = 't', long)]
+    target: String,
+
+    /// Protocol to press-test
+    #[arg(short = 'P', long, default_value = "http1")]
+    protocol: PressProtocolArg,
+
+    /// Number of concurrent connections
+    #[arg(short = 'c', long, default_value = "10")]
+    concurrency: usize,
+
+    /// Total number of requests to send
+    #[arg(short = 'n', long, default_value = "100")]
+    num_requests: usize,
+
+    /// Timeout per request in seconds
+    #[arg(short = 'T', long, default_value = "30")]
+    timeout: u64,
+
+    /// Skip TLS certificate verification (for local test servers)
+    #[arg(long)]
+    insecure: bool,
+
+    /// Enable verbose logging
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Resolve domain names locally instead of at the proxy
+    #[arg(short = 'r', long)]
+    resolve: bool,
+}
+
+#[derive(Clone, ValueEnum)]
+enum PressProtocolArg {
+    Http1,
+    Http2,
+    Http3,
+}
+
+impl From<PressProtocolArg> for PressProtocol {
+    fn from(v: PressProtocolArg) -> Self {
+        match v {
+            PressProtocolArg::Http1 => PressProtocol::Http1,
+            PressProtocolArg::Http2 => PressProtocol::Http2,
+            PressProtocolArg::Http3 => PressProtocol::Http3,
+        }
+    }
+}
+
+// ---------------- HTTP test server ----------------
+
+#[derive(Args, Clone)]
+struct ServeHttpArgs {
+    /// Address to bind on.
+    #[arg(short = 'b', long, default_value = "127.0.0.1")]
+    bind: IpAddr,
+
+    /// Port for plain HTTP/1 server.
+    #[arg(long, default_value = "8080")]
+    http1_port: u16,
+
+    /// Port for TLS HTTP/2 server.
+    #[arg(long, default_value = "8443")]
+    http2_port: u16,
+
+    /// Port for QUIC HTTP/3 server.
+    #[arg(long, default_value = "8444")]
+    http3_port: u16,
+
+    /// Response body size in bytes.
+    #[arg(long, default_value = "128")]
+    response_size: usize,
+}
+
 // ---------------- parsing helpers ----------------
 
 fn parse_proxy_url(raw: &str) -> anyhow::Result<ProxyConfig> {
@@ -242,7 +331,7 @@ fn parse_proxy_url(raw: &str) -> anyhow::Result<ProxyConfig> {
     Ok(ProxyConfig { addr, auth })
 }
 
-fn parse_target_url(raw: &str) -> anyhow::Result<TestTarget> {
+fn parse_target_url(raw: &str, insecure: bool) -> anyhow::Result<TestTarget> {
     let url = Url::parse(raw)?;
 
     let use_tls = url.scheme() == "https";
@@ -259,6 +348,7 @@ fn parse_target_url(raw: &str) -> anyhow::Result<TestTarget> {
         path,
         use_tls,
         resolved_addr: None,
+        danger_accept_invalid_certs: insecure,
     })
 }
 
@@ -314,6 +404,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Test(args) => run_test(args).await,
         Command::Benchmark(args) => run_benchmark(args).await,
         Command::Server(args) => run_bench_server(args).await,
+        Command::Press(args) => run_press(args).await,
+        Command::ServeHttp(args) => run_serve_http(args).await,
     }
 }
 
@@ -325,7 +417,7 @@ async fn run_test(args: TestArgs) -> anyhow::Result<()> {
         .target
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--target is required"))?;
-    let mut target = parse_target_url(target_url)?;
+    let mut target = parse_target_url(target_url, false)?;
     let timeout = Duration::from_secs(args.timeout);
 
     if let Some(dns) = &dns_cfg {
@@ -412,4 +504,56 @@ async fn run_benchmark(args: BenchArgs) -> anyhow::Result<()> {
 async fn run_bench_server(args: ServerArgs) -> anyhow::Result<()> {
     install_logging(args.verbose);
     run_server(args.bind, args.port).await
+}
+
+// ---------------- press ----------------
+
+async fn run_press(args: PressArgs) -> anyhow::Result<()> {
+    install_logging(args.verbose);
+    let transport = args.transport.build()?;
+    let dns_cfg = args.transport.build_dns()?;
+    let mut target = parse_target_url(&args.target, args.insecure)?;
+    let timeout = Duration::from_secs(args.timeout);
+
+    if let Some(dns) = &dns_cfg {
+        if target.host.parse::<IpAddr>().is_err() {
+            let ip = dns::resolve_a(&transport, dns, &target.host).await?;
+            target.resolved_addr = Some(IpAddr::V4(ip));
+        }
+    } else if args.resolve {
+        target.resolve_local().await?;
+    }
+
+    let protocol: PressProtocol = args.protocol.into();
+
+    let opts = PressOptions {
+        transport,
+        target,
+        protocol,
+        concurrency: args.concurrency,
+        num_requests: args.num_requests,
+        timeout,
+    };
+
+    let result = press(&opts).await;
+    println!("{result}");
+
+    if result.error_count > 0 && result.success_count == 0 {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------- HTTP test server ----------------
+
+async fn run_serve_http(args: ServeHttpArgs) -> anyhow::Result<()> {
+    let config = HttpServerConfig {
+        bind: args.bind,
+        http1_port: args.http1_port,
+        http2_port: args.http2_port,
+        http3_port: args.http3_port,
+        response_size: args.response_size,
+    };
+    run_http_server(config).await
 }

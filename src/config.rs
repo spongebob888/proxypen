@@ -22,6 +22,8 @@ pub struct TestTarget {
     pub use_tls: bool,
     /// Locally resolved IP address (when --resolve is used).
     pub resolved_addr: Option<IpAddr>,
+    /// Skip TLS certificate verification (for testing with self-signed certs).
+    pub danger_accept_invalid_certs: bool,
 }
 
 impl TestTarget {

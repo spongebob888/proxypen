@@ -64,7 +64,7 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
 
     // TLS handshake with h2 ALPN
     let tls_start = Instant::now();
-    let tls_config = make_tls_config(Some(vec![b"h2".to_vec()]))?;
+    let tls_config = make_tls_config(Some(vec![b"h2".to_vec()]), target.danger_accept_invalid_certs)?;
     let connector = TlsConnector::from(Arc::new(tls_config));
     let server_name = ServerName::try_from(target.host.clone())
         .map_err(|e| ProxyPenError::Tls(format!("invalid server name: {e}")))?;

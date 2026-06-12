@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use bytes::Buf;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::config::{ProxyConfig, TestTarget};
@@ -65,7 +67,7 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
         Some(start.elapsed())
     };
 
-    let client_config = make_quic_client_config()?;
+    let client_config = make_quic_client_config(target.danger_accept_invalid_certs)?;
 
     // QUIC connect
     let quic_start = Instant::now();
@@ -205,19 +207,69 @@ async fn build_direct_endpoint(
     Ok((endpoint, target_addr, None))
 }
 
-fn make_quic_client_config() -> Result<quinn::ClientConfig> {
+fn make_quic_client_config(insecure: bool) -> Result<quinn::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
 
-    let mut tls_config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let config_builder = ClientConfig::builder();
+
+    let mut tls_config = if insecure {
+        config_builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(QuicNoVerify))
+    } else {
+        config_builder
+            .with_root_certificates(root_store)
+    }
+    .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
     let quic_config: QuicClientConfig = tls_config
         .try_into()
         .map_err(|e| ProxyPenError::Quic(format!("QUIC config: {e}")))?;
     Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+}
+
+#[derive(Debug)]
+struct QuicNoVerify;
+
+impl ServerCertVerifier for QuicNoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
 }
 
 /// Resolve target to a SocketAddr for quinn's connect() in SOCKS5 mode.

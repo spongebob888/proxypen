@@ -71,7 +71,7 @@ async fn do_test(transport: &Transport, target: &TestTarget) -> Result<TestResul
     let (http_status, response_size, first_byte) = if target.use_tls {
         // TLS handshake
         let tls_start = Instant::now();
-        let tls_config = make_tls_config(None)?;
+        let tls_config = make_tls_config(None, target.danger_accept_invalid_certs)?;
         let connector = TlsConnector::from(Arc::new(tls_config));
         let server_name = ServerName::try_from(target.host.clone())
             .map_err(|e| ProxyPenError::Tls(format!("invalid server name: {e}")))?;

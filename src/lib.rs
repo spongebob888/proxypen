@@ -8,6 +8,8 @@ pub mod error;
 pub mod http1;
 pub mod http2;
 pub mod http3;
+pub mod http_server;
+pub mod press;
 pub mod result;
 pub mod socks;
 pub mod tls;
@@ -17,6 +19,8 @@ pub mod udp_socket;
 pub use config::{ProxyAuth, ProxyConfig, TestTarget};
 pub use direct::{DirectConfig, InterfaceSpec};
 pub use error::ProxyPenError;
+pub use http_server::{HttpServerConfig, run_server as run_http_server};
+pub use press::{PressOptions, PressProtocol, PressResult, press};
 pub use result::{Protocol, TestResult, TestStatus, Timing};
 pub use transport::Transport;
 

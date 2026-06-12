@@ -4,6 +4,8 @@ A small toolkit for probing SOCKS5 proxies (and the direct path) with:
 
 - **HTTP protocol tests** over HTTP/1.1, HTTP/2, HTTP/3
 - **TCP / UDP throughput benchmarks** with packet-loss, jitter, and one-way latency
+- **Press / retest** — latency percentile (p50, p99) measurement at configurable concurrency
+- **Local HTTP/1, HTTP/2, HTTP/3 test server** for benchmarking against a known target
 
 The same `--proxy` / `--interface` flags drive both. Omit `--proxy` to test
 directly. On a direct test you may bind the outgoing socket to a specific NIC
@@ -37,18 +39,29 @@ proxypen benchmark --serve --duration 5
 proxypen server --bind 0.0.0.0 --port 5555
 #    on the client box:
 proxypen benchmark --target server.example:5555 --mode udp --udp-bandwidth 10M,50M,200M
+
+# 5. Start a local HTTP/1, HTTP/2, HTTP/3 test server
+proxypen serve-http
+
+# 6. Press-test HTTP/1 against the local server (100 requests, 10 concurrent)
+proxypen press -t http://127.0.0.1:8080 -P http1 -c 10 -n 100
+
+# 7. Press-test HTTP/3 through a SOCKS5 proxy
+proxypen press -p socks5://127.0.0.1:1080 -t https://example.com -P http3 -c 20 -n 500 --insecure
 ```
 
 ---
 
 ## Subcommands
 
-| Command                | What it does                                                  |
-|------------------------|---------------------------------------------------------------|
-| `proxypen ...` (flat)  | Same as `proxypen test ...` — backward-compatible default     |
-| `proxypen test`        | HTTP/1, HTTP/2, HTTP/3 correctness + timing probe             |
-| `proxypen benchmark`   | TCP/UDP throughput client                                     |
-| `proxypen server`      | Standalone bench server, for two-host setups                  |
+| Command                  | What it does                                                  |
+|--------------------------|---------------------------------------------------------------|
+| `proxypen ...` (flat)    | Same as `proxypen test ...` — backward-compatible default     |
+| `proxypen test`          | HTTP/1, HTTP/2, HTTP/3 correctness + timing probe             |
+| `proxypen benchmark`     | TCP/UDP throughput client                                     |
+| `proxypen server`        | Standalone bench server, for two-host setups                  |
+| `proxypen press`         | Latency retest: p50/p99 TTFB at given concurrency             |
+| `proxypen serve-http`    | Local HTTP/1 + HTTP/2 + HTTP/3 test server (self-signed cert) |
 
 ---
 
@@ -186,6 +199,132 @@ proxypen server
 
 # Loopback only, fixed port
 proxypen server --bind 127.0.0.1 --port 5555
+```
+
+---
+
+## Press / retest (latency percentiles)
+
+```
+proxypen press -t URL -P PROTO [-p PROXY] [-i IFACE] [-c N] [-n N] [-T SECS] [--insecure] [-v]
+```
+
+| Flag                  | Meaning                                                       |
+|-----------------------|---------------------------------------------------------------|
+| `-t, --target URL`    | `http[s]://host[:port]/path`. **Required.**                   |
+| `-P, --protocol P`    | `http1` \| `http2` \| `http3` (default: `http1`)               |
+| `-p, --proxy URL`     | SOCKS5 proxy `socks5://[user:pass@]host:port`. Omit ⇒ direct. |
+| `-i, --interface S`   | Direct mode only. Interface name (`en0`) or local IP.         |
+| `-c, --concurrency N` | Number of concurrent connections. Default `10`.               |
+| `-n, --num-requests N`| Total number of requests to send. Default `100`.              |
+| `-T, --timeout SECS`  | Per-request timeout. Default `30`.                            |
+| `--insecure`          | Skip TLS certificate verification (for self-signed servers).  |
+| `-r, --resolve`       | Resolve DNS locally instead of letting the proxy do it.       |
+| `--dns-server ADDR`   | Use this DNS server for resolution.                           |
+| `-v, --verbose`       | Debug logging.                                                |
+
+The press command opens `-c` concurrent connections and sends `-n` total
+requests, measuring TTFB (Time To First Byte) and total request duration for
+each one. Latency distributions (min, avg, p50, p90, p95, p99, max) are
+computed from the successful responses.
+
+Output:
+
+```
+=== Press Test Results ===
+Protocol:        HTTP/1.1
+Total requests:  100
+Successful:      100
+Failed:          0
+Duration:        0.02s
+Req/sec:         5203.47
+
+--- TTFB (Time To First Byte) ---
+  min:     0.31 ms
+  avg:     0.68 ms
+  p50:     0.58 ms
+  p90:     0.95 ms
+  p95:     1.21 ms
+  p99:     1.52 ms
+  max:     1.64 ms
+
+--- Total Request Time ---
+  min:     0.42 ms
+  avg:     0.79 ms
+  p50:     0.66 ms
+  p90:     1.12 ms
+  p95:     1.63 ms
+  p99:     3.81 ms
+  max:     4.12 ms
+```
+
+Examples:
+
+```sh
+# HTTP/1, 50 concurrent, 500 total requests, direct
+proxypen press -t http://127.0.0.1:8080 -P http1 -c 50 -n 500
+
+# HTTP/2, 20 concurrent, 200 requests through a SOCKS5 proxy (self-signed cert)
+proxypen press -p socks5://127.0.0.1:1080 -t https://server:8443 -P http2 \
+                -c 20 -n 200 --insecure
+
+# HTTP/3, direct, bound to a specific interface
+proxypen press -i en0 -t https://example.com -P http3 -c 5 -n 50
+
+# HTTP/2 against a public server (no --insecure needed)
+proxypen press -t https://www.cloudflare.com -P http2 -c 10 -n 100
+```
+
+---
+
+## HTTP test server (local)
+
+```
+proxypen serve-http [-b BIND] [--http1-port N] [--http2-port N] [--http3-port N]
+                    [--response-size BYTES]
+```
+
+| Flag                       | Default       | Meaning                                     |
+|----------------------------|---------------|---------------------------------------------|
+| `-b, --bind IP`            | `127.0.0.1`   | Address to bind all listeners on.           |
+| `--http1-port N`           | `8080`        | Plain HTTP/1.1 port.                        |
+| `--http2-port N`           | `8443`        | TLS HTTP/2 port (ALPN: h2, http/1.1).       |
+| `--http3-port N`           | `8444`        | QUIC HTTP/3 port.                           |
+| `--response-size BYTES`    | `128`         | Body size of every response (filled with x).|
+
+Starts all three HTTP protocol servers on separate ports using a single
+self-signed TLS certificate (CN: `proxypen-test.local`). Use `--insecure` on
+the client side to skip verification when testing against it.
+
+The server prints the exact press commands you need after startup:
+
+```
+=== HTTP Test Server ===
+Certificate CN: proxypen-test.local
+
+HTTP/1  (plain) → http://127.0.0.1:8080
+HTTP/2  (TLS)   → https://127.0.0.1:8443
+HTTP/3  (QUIC)  → https://127.0.0.1:8444
+
+Press Ctrl+C to stop.
+
+Test commands:
+  proxypen press -t http://127.0.0.1:8080 -P http1 -c 10 -n 100
+  proxypen press -t https://127.0.0.1:8443 -P http2 -c 10 -n 100 --insecure
+  proxypen press -t https://127.0.0.1:8444 -P http3 -c 10 -n 100 --insecure
+```
+
+Examples:
+
+```sh
+# Default setup on localhost
+proxypen serve-http
+
+# Bind to all interfaces, custom ports
+proxypen serve-http --bind 0.0.0.0 --http1-port 80 --http2-port 443 --http3-port 443
+
+# Larger response body (1 KB)
+proxypen serve-http --response-size 1024
 ```
 
 ---

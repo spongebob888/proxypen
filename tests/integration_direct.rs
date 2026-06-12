@@ -27,6 +27,7 @@ fn target_for(addr: std::net::SocketAddr) -> TestTarget {
         path: "/".into(),
         use_tls: false,
         resolved_addr: Some(addr.ip()),
+        danger_accept_invalid_certs: false,
     }
 }
 
@@ -173,6 +174,7 @@ async fn http1_direct_uses_custom_dns_to_reach_local_server() {
         path: "/".into(),
         use_tls: false,
         resolved_addr: Some(IpAddr::V4(ip)),
+        danger_accept_invalid_certs: false,
     };
     let pen = ProxyPen::new(transport);
     let result = pen.test_http1(&target, Duration::from_secs(5)).await;

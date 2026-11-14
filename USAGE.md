@@ -68,7 +68,7 @@ proxypen press -p socks5://127.0.0.1:1080 -t https://example.com -P http3 -c 20 
 ## HTTP protocol test
 
 ```
-proxypen [test] [-p PROXY] [-i IFACE] -t URL [-P PROTO] [-T SECS] [-r] [-v]
+proxypen [test] [-p PROXY] [-i IFACE] -t URL [-P PROTO] [-T SECS] [-r] [--dns-family ipv4|ipv6] [-v]
 ```
 
 | Flag                 | Meaning                                                       |
@@ -80,6 +80,7 @@ proxypen [test] [-p PROXY] [-i IFACE] -t URL [-P PROTO] [-T SECS] [-r] [-v]
 | `-T, --timeout SECS` | Per-test timeout. Default `30`.                               |
 | `-r, --resolve`      | Resolve DNS locally with the system resolver (instead of letting the proxy do it). |
 | `--dns-server ADDR`  | Use this DNS server (IP or IP:PORT, default port 53). The query is sent via the configured transport — see "DNS resolution" below. |
+| `--dns-family F`     | DNS answer family: `ipv4` or `ipv6`. Applies to `--dns-server` and `--resolve`. |
 | `-v, --verbose`      | Debug logging.                                                |
 
 Examples:
@@ -388,11 +389,16 @@ server:
   that interface.
 - `--dns-server` alone → plain UDP query on the default route.
 
-Only A records are supported today; AAAA is not.
+By default, `--dns-server` queries A records. Pass `--dns-family ipv6` to query
+AAAA records instead. With `--resolve`, `--dns-family` filters the system
+resolver result to IPv4 or IPv6.
 
 ```sh
 # Resolve via Cloudflare, then HTTP/1 to that IP directly
 proxypen --dns-server 1.1.1.1 -t http://example.com/ -P http1
+
+# Resolve an IPv6 address via Cloudflare
+proxypen --dns-server 2606:4700:4700::1111 --dns-family ipv6 -t https://example.com/
 
 # Direct test on en0, with DNS also on en0
 proxypen -i en0 --dns-server 8.8.8.8 -t https://example.com/ -P http2

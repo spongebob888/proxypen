@@ -1,11 +1,9 @@
-//! Minimal DNS resolver that issues a single A query over the supplied
+//! Minimal DNS resolver that issues a single A or AAAA query over the supplied
 //! [`Transport`]. The query inherits the transport's routing — bound to
 //! `--interface` in direct mode, or relayed through SOCKS5 UDP ASSOCIATE in
 //! proxy mode.
-//!
-//! Only A records are returned. AAAA is out of scope for now.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::error::{ProxyPenError, Result};
@@ -15,15 +13,31 @@ pub const DEFAULT_DNS_PORT: u16 = 53;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LABEL_LEN: usize = 63;
 const MAX_NAME_LEN: usize = 255;
+const QTYPE_A: u16 = 1;
+const QTYPE_AAAA: u16 = 28;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsFamily {
+    Ipv4,
+    Ipv6,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct DnsConfig {
     pub server: SocketAddr,
+    pub family: DnsFamily,
 }
 
 impl DnsConfig {
     pub fn new(server: SocketAddr) -> Self {
-        Self { server }
+        Self {
+            server,
+            family: DnsFamily::Ipv4,
+        }
+    }
+
+    pub fn with_family(server: SocketAddr, family: DnsFamily) -> Self {
+        Self { server, family }
     }
 }
 
@@ -43,11 +57,41 @@ pub fn parse_server(raw: &str) -> Result<SocketAddr> {
 
 /// Resolve `hostname` to an IPv4 address by querying `dns.server` via the
 /// supplied transport.
-pub async fn resolve_a(
+pub async fn resolve_a(transport: &Transport, dns: &DnsConfig, hostname: &str) -> Result<Ipv4Addr> {
+    match resolve_with_qtype(transport, dns, hostname, QTYPE_A).await? {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(_) => unreachable!("A query returned IPv6 address"),
+    }
+}
+
+/// Resolve `hostname` to an IPv6 address by querying `dns.server` via the
+/// supplied transport.
+pub async fn resolve_aaaa(
     transport: &Transport,
     dns: &DnsConfig,
     hostname: &str,
-) -> Result<Ipv4Addr> {
+) -> Result<Ipv6Addr> {
+    match resolve_with_qtype(transport, dns, hostname, QTYPE_AAAA).await? {
+        IpAddr::V4(_) => unreachable!("AAAA query returned IPv4 address"),
+        IpAddr::V6(ip) => Ok(ip),
+    }
+}
+
+/// Resolve `hostname` to the address family configured in `dns`.
+pub async fn resolve_ip(transport: &Transport, dns: &DnsConfig, hostname: &str) -> Result<IpAddr> {
+    let qtype = match dns.family {
+        DnsFamily::Ipv4 => QTYPE_A,
+        DnsFamily::Ipv6 => QTYPE_AAAA,
+    };
+    resolve_with_qtype(transport, dns, hostname, qtype).await
+}
+
+async fn resolve_with_qtype(
+    transport: &Transport,
+    dns: &DnsConfig,
+    hostname: &str,
+    qtype: u16,
+) -> Result<IpAddr> {
     if hostname.len() > MAX_NAME_LEN {
         return Err(ProxyPenError::InvalidConfig(format!(
             "DNS hostname too long: {hostname}"
@@ -56,7 +100,7 @@ pub async fn resolve_a(
 
     let socket = transport.open_udp(dns.server).await?;
     let id = random_id();
-    let query = encode_query(id, hostname)?;
+    let query = encode_query(id, hostname, qtype)?;
     socket.send(&query).await?;
 
     let mut buf = vec![0u8; 1500];
@@ -66,7 +110,7 @@ pub async fn resolve_a(
             ProxyPenError::InvalidConfig(format!("DNS query to {} timed out", dns.server))
         })??;
 
-    decode_a_response(id, &buf[..n])
+    decode_response(id, qtype, &buf[..n])
 }
 
 fn random_id() -> u16 {
@@ -78,7 +122,7 @@ fn random_id() -> u16 {
     (n & 0xFFFF) as u16
 }
 
-fn encode_query(id: u16, hostname: &str) -> Result<Vec<u8>> {
+fn encode_query(id: u16, hostname: &str, qtype: u16) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
     // Header: ID, flags, QDCOUNT=1, others=0
     buf.extend_from_slice(&id.to_be_bytes());
@@ -102,12 +146,26 @@ fn encode_query(id: u16, hostname: &str) -> Result<Vec<u8>> {
         buf.extend_from_slice(bytes);
     }
     buf.push(0); // root
-    buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    buf.extend_from_slice(&qtype.to_be_bytes());
     buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
     Ok(buf)
 }
 
 pub fn decode_a_response(expected_id: u16, buf: &[u8]) -> Result<Ipv4Addr> {
+    match decode_response(expected_id, QTYPE_A, buf)? {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(_) => unreachable!("A response decoded as IPv6 address"),
+    }
+}
+
+pub fn decode_aaaa_response(expected_id: u16, buf: &[u8]) -> Result<Ipv6Addr> {
+    match decode_response(expected_id, QTYPE_AAAA, buf)? {
+        IpAddr::V4(_) => unreachable!("AAAA response decoded as IPv4 address"),
+        IpAddr::V6(ip) => Ok(ip),
+    }
+}
+
+fn decode_response(expected_id: u16, expected_qtype: u16, buf: &[u8]) -> Result<IpAddr> {
     if buf.len() < 12 {
         return Err(ProxyPenError::InvalidConfig(
             "DNS response too short".into(),
@@ -156,31 +214,38 @@ pub fn decode_a_response(expected_id: u16, buf: &[u8]) -> Result<Ipv4Addr> {
         let rdlength = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
         pos += 10;
         if pos + rdlength > buf.len() {
-            return Err(ProxyPenError::InvalidConfig(
-                "DNS rdata truncated".into(),
-            ));
+            return Err(ProxyPenError::InvalidConfig("DNS rdata truncated".into()));
         }
-        if rtype == 1 && rdlength == 4 {
-            return Ok(Ipv4Addr::new(
+        if rtype == QTYPE_A && expected_qtype == QTYPE_A && rdlength == 4 {
+            return Ok(IpAddr::V4(Ipv4Addr::new(
                 buf[pos],
                 buf[pos + 1],
                 buf[pos + 2],
                 buf[pos + 3],
-            ));
+            )));
+        }
+        if rtype == QTYPE_AAAA && expected_qtype == QTYPE_AAAA && rdlength == 16 {
+            let octets: [u8; 16] = buf[pos..pos + 16]
+                .try_into()
+                .expect("slice length checked above");
+            return Ok(IpAddr::V6(Ipv6Addr::from(octets)));
         }
         pos += rdlength;
     }
-    Err(ProxyPenError::InvalidConfig(
-        "DNS response had no A record".into(),
-    ))
+    let record_name = if expected_qtype == QTYPE_AAAA {
+        "AAAA"
+    } else {
+        "A"
+    };
+    Err(ProxyPenError::InvalidConfig(format!(
+        "DNS response had no {record_name} record"
+    )))
 }
 
 fn skip_name(buf: &[u8], mut pos: usize) -> Result<usize> {
     loop {
         if pos >= buf.len() {
-            return Err(ProxyPenError::InvalidConfig(
-                "DNS name truncated".into(),
-            ));
+            return Err(ProxyPenError::InvalidConfig("DNS name truncated".into()));
         }
         let len = buf[pos];
         if len == 0 {
@@ -224,7 +289,7 @@ mod tests {
     #[test]
     fn encode_then_decode_roundtrip() {
         let id: u16 = 0x1234;
-        let q = encode_query(id, "example.com").unwrap();
+        let q = encode_query(id, "example.com", QTYPE_A).unwrap();
         // Build a synthetic response: copy the query, set ANCOUNT=1, append
         // a compressed-pointer answer with A 93.184.216.34.
         let mut r = q.clone();
@@ -245,18 +310,43 @@ mod tests {
     }
 
     #[test]
+    fn encode_then_decode_aaaa_roundtrip() {
+        let id: u16 = 0x5678;
+        let q = encode_query(id, "example.com", QTYPE_AAAA).unwrap();
+        let mut r = q.clone();
+        r[2] = 0x81;
+        r[3] = 0x80;
+        r[6] = 0x00;
+        r[7] = 0x01;
+        r.extend_from_slice(&[0xC0, 0x0C]);
+        r.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&60u32.to_be_bytes());
+        r.extend_from_slice(&16u16.to_be_bytes());
+        let expected = Ipv6Addr::new(0x2606, 0x2800, 0x220, 0x1, 0, 0, 0, 0x34);
+        r.extend_from_slice(&expected.octets());
+
+        let ip = decode_aaaa_response(id, &r).unwrap();
+        assert_eq!(ip, expected);
+    }
+
+    #[test]
     fn decode_rejects_wrong_id() {
         let mut r = vec![0u8; 12];
-        r[0] = 0; r[1] = 1; // id=1
-        r[6] = 0; r[7] = 1; // ANCOUNT=1 (not consulted because id mismatch fires first)
+        r[0] = 0;
+        r[1] = 1; // id=1
+        r[6] = 0;
+        r[7] = 1; // ANCOUNT=1 (not consulted because id mismatch fires first)
         assert!(decode_a_response(99, &r).is_err());
     }
 
     #[test]
     fn decode_rejects_nxdomain() {
         let mut r = vec![0u8; 12];
-        r[0] = 0; r[1] = 7; // id=7
-        r[2] = 0x81; r[3] = 0x83; // RCODE=3 NXDOMAIN
+        r[0] = 0;
+        r[1] = 7; // id=7
+        r[2] = 0x81;
+        r[3] = 0x83; // RCODE=3 NXDOMAIN
         assert!(decode_a_response(7, &r).is_err());
     }
 }

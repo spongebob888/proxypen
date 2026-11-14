@@ -3,8 +3,7 @@
 // happen to call.
 #![allow(dead_code)]
 
-
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Once;
 
 use shadowquic::Manager;
@@ -119,6 +118,11 @@ impl Drop for Socks5Guard {
 /// Returns the bind address and a `oneshot::Sender` whose drop stops the
 /// server.
 pub async fn start_fake_dns(answer: Ipv4Addr) -> (SocketAddr, oneshot::Sender<()>) {
+    start_fake_dns_ip(IpAddr::V4(answer)).await
+}
+
+/// A toy DNS server that answers every query with the supplied A or AAAA record.
+pub async fn start_fake_dns_ip(answer: IpAddr) -> (SocketAddr, oneshot::Sender<()>) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -139,7 +143,7 @@ pub async fn start_fake_dns(answer: Ipv4Addr) -> (SocketAddr, oneshot::Sender<()
     (addr, stop_tx)
 }
 
-fn build_dns_response(req: &[u8], answer: Ipv4Addr) -> Option<Vec<u8>> {
+fn build_dns_response(req: &[u8], answer: IpAddr) -> Option<Vec<u8>> {
     if req.len() < 12 {
         return None;
     }
@@ -150,13 +154,17 @@ fn build_dns_response(req: &[u8], answer: Ipv4Addr) -> Option<Vec<u8>> {
     // ANCOUNT = 1
     r[6] = 0;
     r[7] = 1;
-    // Append answer: NAME pointer to offset 12, TYPE=A, CLASS=IN, TTL=60, RDLEN=4, IP.
+    let (qtype, rdata) = match answer {
+        IpAddr::V4(ip) => (1u16, ip.octets().to_vec()),
+        IpAddr::V6(ip) => (28u16, ip.octets().to_vec()),
+    };
+    // Append answer: NAME pointer to offset 12, TYPE=A/AAAA, CLASS=IN, TTL=60, RDLEN, IP.
     r.extend_from_slice(&[0xC0, 0x0C]);
-    r.extend_from_slice(&1u16.to_be_bytes());
+    r.extend_from_slice(&qtype.to_be_bytes());
     r.extend_from_slice(&1u16.to_be_bytes());
     r.extend_from_slice(&60u32.to_be_bytes());
-    r.extend_from_slice(&4u16.to_be_bytes());
-    r.extend_from_slice(&answer.octets());
+    r.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    r.extend_from_slice(&rdata);
     Some(r)
 }
 

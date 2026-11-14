@@ -2,6 +2,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use shadowquic::msgs::socks5::SocksAddr;
 
+use crate::dns::DnsFamily;
+
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub addr: String,
@@ -29,12 +31,24 @@ pub struct TestTarget {
 impl TestTarget {
     /// Resolve the host locally using system DNS.
     pub async fn resolve_local(&mut self) -> std::io::Result<()> {
+        self.resolve_local_with_family(None).await
+    }
+
+    /// Resolve the host locally using system DNS, optionally filtering by IP family.
+    pub async fn resolve_local_with_family(
+        &mut self,
+        family: Option<DnsFamily>,
+    ) -> std::io::Result<()> {
         if self.host.parse::<IpAddr>().is_ok() {
             return Ok(());
         }
         let addr = tokio::net::lookup_host(format!("{}:{}", self.host, self.port))
             .await?
-            .next()
+            .find(|sa| match family {
+                Some(DnsFamily::Ipv4) => sa.is_ipv4(),
+                Some(DnsFamily::Ipv6) => sa.is_ipv6(),
+                None => true,
+            })
             .map(|sa| sa.ip());
         self.resolved_addr = addr;
         Ok(())

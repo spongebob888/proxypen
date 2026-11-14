@@ -2,16 +2,16 @@
 
 mod common;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use proxypen::bench::{
-    BenchDirection, BenchMode, BenchOptions, run_client_quiet,
-};
-use proxypen::dns::{self, DnsConfig};
+use proxypen::bench::{BenchDirection, BenchMode, BenchOptions, run_client_quiet};
+use proxypen::dns::{self, DnsConfig, DnsFamily};
 use proxypen::{ProxyConfig, ProxyPen, TestStatus, TestTarget, Transport};
 
-use common::{install_rustls, start_fake_dns, start_http1_echo, start_socks5_server};
+use common::{
+    install_rustls, start_fake_dns, start_fake_dns_ip, start_http1_echo, start_socks5_server,
+};
 
 fn target_for(addr: std::net::SocketAddr) -> TestTarget {
     TestTarget {
@@ -69,14 +69,19 @@ async fn bench_tcp_through_socks5() {
         udp_size: 1200,
         tcp_chunk: 65536,
     };
-    let outcomes = run_client_quiet(opts).await.expect("bench tcp via socks5 failed");
+    let outcomes = run_client_quiet(opts)
+        .await
+        .expect("bench tcp via socks5 failed");
 
     assert_eq!(outcomes.len(), 2);
     let up = &outcomes[0];
     assert!(up.client.bytes > 0, "TCP-up over SOCKS5 sent nothing");
     assert!(up.server.bytes > 0, "TCP-up over SOCKS5 received nothing");
     let down = &outcomes[1];
-    assert!(down.client.bytes > 0, "TCP-down over SOCKS5 received nothing");
+    assert!(
+        down.client.bytes > 0,
+        "TCP-down over SOCKS5 received nothing"
+    );
 }
 
 #[tokio::test]
@@ -93,6 +98,20 @@ async fn dns_resolve_through_socks5_udp_associate() {
         .await
         .expect("DNS over SOCKS5 failed");
     assert_eq!(ip, Ipv4Addr::new(42, 42, 42, 42));
+}
+
+#[tokio::test]
+async fn dns_resolve_aaaa_through_socks5_udp_associate() {
+    let proxy = start_socks5_server().await;
+    let answer = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    let (dns_addr, _stop_dns) = start_fake_dns_ip(IpAddr::V6(answer)).await;
+
+    let transport = socks_transport(proxy.addr);
+    let dns = DnsConfig::with_family(dns_addr, DnsFamily::Ipv6);
+    let ip = dns::resolve_ip(&transport, &dns, "via.proxy.test")
+        .await
+        .expect("DNS AAAA over SOCKS5 failed");
+    assert_eq!(ip, IpAddr::V6(answer));
 }
 
 #[tokio::test]
@@ -113,7 +132,9 @@ async fn bench_udp_through_socks5() {
         udp_size: 1200,
         tcp_chunk: 65536,
     };
-    let outcomes = run_client_quiet(opts).await.expect("bench udp via socks5 failed");
+    let outcomes = run_client_quiet(opts)
+        .await
+        .expect("bench udp via socks5 failed");
 
     assert_eq!(outcomes.len(), 1);
     let o = &outcomes[0];

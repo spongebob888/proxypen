@@ -2,19 +2,15 @@
 
 mod common;
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use proxypen::bench::{
-    BenchDirection, BenchMode, BenchOptions, run_client_quiet,
-};
+use proxypen::bench::{BenchDirection, BenchMode, BenchOptions, run_client_quiet};
 use proxypen::direct::parse_interface;
-use proxypen::dns::{self, DnsConfig};
-use proxypen::{
-    DirectConfig, InterfaceSpec, ProxyPen, TestStatus, TestTarget, Transport,
-};
+use proxypen::dns::{self, DnsConfig, DnsFamily};
+use proxypen::{DirectConfig, InterfaceSpec, ProxyPen, TestStatus, TestTarget, Transport};
 
-use common::{install_rustls, start_fake_dns, start_http1_echo};
+use common::{install_rustls, start_fake_dns, start_fake_dns_ip, start_http1_echo};
 
 fn direct_transport() -> Transport {
     Transport::Direct(DirectConfig::new(None))
@@ -47,8 +43,14 @@ async fn http1_direct_against_local_server() {
     );
     assert_eq!(result.http_status, Some(200));
     let timing = &result.timing;
-    assert!(timing.tcp_connect.is_some(), "direct mode should record tcp_connect");
-    assert!(timing.socks_handshake.is_none(), "direct mode should not record socks_handshake");
+    assert!(
+        timing.tcp_connect.is_some(),
+        "direct mode should record tcp_connect"
+    );
+    assert!(
+        timing.socks_handshake.is_none(),
+        "direct mode should not record socks_handshake"
+    );
     assert!(result.response_size.unwrap_or(0) > 0);
 }
 
@@ -150,6 +152,17 @@ async fn dns_resolve_direct_via_fake_server() {
         .await
         .expect("DNS resolve failed");
     assert_eq!(ip, Ipv4Addr::new(10, 11, 12, 13));
+}
+
+#[tokio::test]
+async fn dns_resolve_aaaa_direct_via_fake_server() {
+    let answer = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let (dns_addr, _stop) = start_fake_dns_ip(IpAddr::V6(answer)).await;
+    let dns = DnsConfig::with_family(dns_addr, DnsFamily::Ipv6);
+    let ip = dns::resolve_ip(&direct_transport(), &dns, "anywhere.test")
+        .await
+        .expect("DNS AAAA resolve failed");
+    assert_eq!(ip, IpAddr::V6(answer));
 }
 
 #[tokio::test]

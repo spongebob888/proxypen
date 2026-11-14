@@ -9,7 +9,7 @@ use proxypen::{
         BenchDirection, BenchMode, BenchOptions, parse_bandwidth_list, run_client, run_server,
     },
     direct::parse_interface,
-    dns::{self, DnsConfig},
+    dns::{self, DnsConfig, DnsFamily},
     press,
     run_http_server,
 };
@@ -63,6 +63,11 @@ struct TransportArgs {
     /// for `test`/`benchmark`).
     #[arg(long, global = true)]
     dns_server: Option<String>,
+
+    /// IP family to use for local DNS resolution: ipv4 or ipv6.
+    /// Applies to --dns-server and --resolve.
+    #[arg(long, global = true)]
+    dns_family: Option<DnsFamilyArg>,
 }
 
 impl TransportArgs {
@@ -82,7 +87,28 @@ impl TransportArgs {
     fn build_dns(&self) -> anyhow::Result<Option<DnsConfig>> {
         match &self.dns_server {
             None => Ok(None),
-            Some(s) => Ok(Some(DnsConfig::new(dns::parse_server(s)?))),
+            Some(s) => Ok(Some(DnsConfig::with_family(
+                dns::parse_server(s)?,
+                self.dns_family
+                    .clone()
+                    .map(Into::into)
+                    .unwrap_or(DnsFamily::Ipv4),
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, ValueEnum)]
+enum DnsFamilyArg {
+    Ipv4,
+    Ipv6,
+}
+
+impl From<DnsFamilyArg> for DnsFamily {
+    fn from(v: DnsFamilyArg) -> Self {
+        match v {
+            DnsFamilyArg::Ipv4 => DnsFamily::Ipv4,
+            DnsFamilyArg::Ipv6 => DnsFamily::Ipv6,
         }
     }
 }
@@ -362,7 +388,7 @@ async fn parse_bench_target(
     }
     if let Some(dns) = dns {
         let (host, port) = split_host_port(raw)?;
-        let ip = dns::resolve_a(transport, dns, host).await?;
+        let ip = dns::resolve_ip(transport, dns, host).await?;
         return Ok(SocketAddr::from((ip, port)));
     }
     tokio::net::lookup_host(raw)
@@ -424,11 +450,12 @@ async fn run_test(args: TestArgs) -> anyhow::Result<()> {
         // --dns-server implies local resolution through the configured
         // transport. Skip the system resolver path.
         if target.host.parse::<IpAddr>().is_err() {
-            let ip = dns::resolve_a(&transport, dns, &target.host).await?;
-            target.resolved_addr = Some(IpAddr::V4(ip));
+            target.resolved_addr = Some(dns::resolve_ip(&transport, dns, &target.host).await?);
         }
     } else if args.resolve {
-        target.resolve_local().await?;
+        target
+            .resolve_local_with_family(args.transport.dns_family.clone().map(Into::into))
+            .await?;
     }
 
     let pen = ProxyPen::new(transport);
@@ -459,10 +486,7 @@ async fn run_test(args: TestArgs) -> anyhow::Result<()> {
 
 fn header_line(args: &TestArgs, target: &TestTarget) -> String {
     match &args.transport.proxy {
-        Some(proxy) => format!(
-            "Testing proxy {} -> {}:{}",
-            proxy, target.host, target.port
-        ),
+        Some(proxy) => format!("Testing proxy {} -> {}:{}", proxy, target.host, target.port),
         None => {
             let mut line = format!("Testing direct -> {}:{}", target.host, target.port);
             if let Some(iface) = &args.transport.interface {

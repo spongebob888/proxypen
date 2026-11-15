@@ -2,6 +2,8 @@
 name = "proxypen"
 version = "0.1.1"
 edition = "2024"
+description = "A toolbox for testing proxy functionality and performance"
+license = "MIT"
 
 [[bin]]
 name = "proxypen"
